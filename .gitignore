@@ -180,3 +180,9 @@ outputs/
 
 # Traces
 *.pt.trace.json
+
+config/
+prof/advisor_py_min/
+prof/intel_roofline/
+prof/intel_roofline_clean/
+prof/intel_roofline_py310/

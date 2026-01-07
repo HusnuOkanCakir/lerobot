@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import argparse
+import contextlib
 import time
 from collections import defaultdict
 import json
@@ -200,6 +201,7 @@ class LayerOpTracer:
             if self.leaf_only and not self._is_leaf(child):
                 continue
             full_name = f"{prefix}.{name}"
+            
             self._handles.append(
                 child.register_forward_pre_hook(
                     lambda mod, inputs, n=full_name: self._pre_hook(mod, inputs, n)
@@ -369,6 +371,11 @@ def main() -> None:
         help="Enable torch.profiler trace export for TensorBoard.",
     )
     parser.add_argument(
+        "--profile_region",
+        default="",
+        help="Optional region name to annotate just the inference loop.",
+    )
+    parser.add_argument(
         "--trace_dir",
         default="prof/trace_inference",
         help="Output directory for TensorBoard trace files.",
@@ -458,23 +465,28 @@ def main() -> None:
         for _ in range(args.warmup_iters):
             _ = policy.select_action(batch)
 
-        for _ in range(args.profile_iters):
-            if device in ("cuda", "mps"):
-                if device == "cuda" and torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                elif device == "mps" and torch.backends.mps.is_available():
-                    torch.mps.synchronize()
-            start = time.perf_counter()
-            # action = policy.select_action(batch)
-            action = policy.predict_action_chunk(batch)[:, 0]
+        region_ctx = contextlib.nullcontext()
+        if args.profile_region:
+            region_ctx = torch.profiler.record_function(args.profile_region)
 
-            if device in ("cuda", "mps"):
-                if device == "cuda" and torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                elif device == "mps" and torch.backends.mps.is_available():
-                    torch.mps.synchronize()
-            end = time.perf_counter()
-            timings.append(end - start)
+        with region_ctx:
+            for _ in range(args.profile_iters):
+                if device in ("cuda", "mps"):
+                    if device == "cuda" and torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    elif device == "mps" and torch.backends.mps.is_available():
+                        torch.mps.synchronize()
+                start = time.perf_counter()
+                # action = policy.select_action(batch)
+                action = policy.predict_action_chunk(batch)[:, 0]
+
+                if device in ("cuda", "mps"):
+                    if device == "cuda" and torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    elif device == "mps" and torch.backends.mps.is_available():
+                        torch.mps.synchronize()
+                end = time.perf_counter()
+                timings.append(end - start)
 
         if prof_ctx is not None:
             prof_ctx.__exit__(None, None, None)
