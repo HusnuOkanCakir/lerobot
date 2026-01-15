@@ -188,3 +188,6 @@ prof/intel_roofline_clean/
 prof/intel_roofline_py310/
 
 *.onnx
+*.csv
+*.png
+*.ncu-rep
