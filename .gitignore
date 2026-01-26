@@ -191,3 +191,5 @@ prof/intel_roofline_py310/
 *.csv
 *.png
 *.ncu-rep
+prof/tensorboard
+prof/ncu*

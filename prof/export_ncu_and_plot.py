@@ -13,8 +13,8 @@ def main() -> None:
         description="Export Nsight Compute .ncu-rep to CSV and plot roofline PNG."
     )
     default_ncu = "ncu"
-    if os_name == "nt":
-        default_ncu = r"C:\Program Files\NVIDIA Corporation\Nsight Compute 2025.4.0\target\windows-desktop-win7-x64\ncu.exe"
+    # if os_name == "nt":
+        # default_ncu = r"C:\Program Files\NVIDIA Corporation\Nsight Compute 2025.4.0\target\windows-desktop-win7-x64\ncu.exe"
     parser.add_argument(
         "rep",
         nargs="?",

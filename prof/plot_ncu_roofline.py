@@ -49,6 +49,45 @@ def _pick_columns(header: list[str], candidates: list[str]) -> list[str]:
     return [c for c in candidates if c in header]
 
 
+def _unit_scale(unit: str) -> float:
+    if unit is None:
+        return 1.0
+    u = str(unit).strip().lower()
+    if u in {"hz"}:
+        return 1.0
+    if u in {"khz"}:
+        return 1e3
+    if u in {"mhz"}:
+        return 1e6
+    if u in {"ghz"}:
+        return 1e9
+    if u in {"byte/s", "bytes/s"}:
+        return 1.0
+    if u in {"kbyte/s", "kbytes/s"}:
+        return 1e3
+    if u in {"mbyte/s", "mbytes/s"}:
+        return 1e6
+    if u in {"gbyte/s", "gbytes/s"}:
+        return 1e9
+    if u in {"byte/cycle", "bytes/cycle"}:
+        return 1.0
+    if u in {"kbyte/cycle", "kbytes/cycle"}:
+        return 1e3
+    if u in {"mbyte/cycle", "mbytes/cycle"}:
+        return 1e6
+    if u in {"gbyte/cycle", "gbytes/cycle"}:
+        return 1e9
+    if u in {"ns"}:
+        return 1e-9
+    if u in {"us"}:
+        return 1e-6
+    if u in {"ms"}:
+        return 1e-3
+    if u in {"s"}:
+        return 1.0
+    return 1.0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Plot a roofline scatter from Nsight Compute CSV.")
     parser.add_argument("--csv", default="prof/ncu_roofline.csv", help="Path to NCU CSV export.")
@@ -85,12 +124,22 @@ def main() -> None:
         "--perf-scale",
         type=float,
         default=1e11,
-        help="Scale factor for Y-axis (1 on plot equals this many FLOP/s).",
+        help="Scale factor for Y-axis label (1 on plot equals this many FLOP/s).",
+    )
+    parser.add_argument(
+        "--scale-perf",
+        action="store_true",
+        help="Divide performance values by --perf-scale for plotting.",
+    )
+    parser.add_argument(
+        "--no-scale-perf",
+        action="store_true",
+        help="Do not divide performance values by --perf-scale for plotting.",
     )
     parser.add_argument(
         "--score-by",
-        choices=["duration", "memory_bw"],
-        default="memory_bw",
+        choices=["duration", "memory_bw", "combined"],
+        default="combined",
         help="Score using duration or memory bandwidth usage.",
     )
     args = parser.parse_args()
@@ -170,18 +219,37 @@ def main() -> None:
         usecols.add(col)
 
     df = pd.read_csv(csv_path, usecols=usecols, encoding=encoding, engine="python")
-    for col in per_cycle_cols + [bytes_col, cycles_per_sec_col]:
+    units_row = df.iloc[0] if len(df) > 0 else None
+    has_units = False
+    if units_row is not None:
+        for col in [bytes_col, cycles_per_sec_col, "gpu__time_duration.sum"]:
+            if col in df.columns:
+                val = units_row.get(col)
+                if isinstance(val, str) and any(ch.isalpha() for ch in val):
+                    has_units = True
+                    break
+    if has_units:
+        df = df.iloc[1:].copy()
+
+    def _scale_col(col: str) -> float:
+        if not has_units or units_row is None:
+            return 1.0
+        return _unit_scale(units_row.get(col))
+
+    for col in per_cycle_cols:
         df[col] = df[col].map(_to_float)
+    df[bytes_col] = df[bytes_col].map(_to_float) * _scale_col(bytes_col)
+    df[cycles_per_sec_col] = df[cycles_per_sec_col].map(_to_float) * _scale_col(cycles_per_sec_col)
     if peak_bw_col:
-        df[peak_bw_col] = df[peak_bw_col].map(_to_float)
+        df[peak_bw_col] = df[peak_bw_col].map(_to_float) * _scale_col(peak_bw_col)
     for col in peak_fp_cols:
         df[col] = df[col].map(_to_float)
     if peak_work_col:
         df[peak_work_col] = df[peak_work_col].map(_to_float)
     if peak_cycles_col:
-        df[peak_cycles_col] = df[peak_cycles_col].map(_to_float)
+        df[peak_cycles_col] = df[peak_cycles_col].map(_to_float) * _scale_col(peak_cycles_col)
     if peak_traffic_cycles_col:
-        df[peak_traffic_cycles_col] = df[peak_traffic_cycles_col].map(_to_float)
+        df[peak_traffic_cycles_col] = df[peak_traffic_cycles_col].map(_to_float) * _scale_col(peak_traffic_cycles_col)
     if "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed" in df.columns:
         df["gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"] = df[
             "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"
@@ -196,7 +264,8 @@ def main() -> None:
     df["ops_per_sec"] = ops_per_cycle * cycles_per_sec
     df["bytes_per_sec"] = df[bytes_col]
     time_col = "gpu__time_duration.sum"
-    df["time_ns"] = df.get(time_col, pd.Series([math.nan] * len(df))).map(_to_float)
+    time_scale = _scale_col(time_col) if time_col in df.columns else 1.0
+    df["time_s"] = df.get(time_col, pd.Series([math.nan] * len(df))).map(_to_float) * time_scale
 
     df = df[(df["ops_per_sec"] > 0) & (df["bytes_per_sec"] > 0)].copy()
     if df.empty:
@@ -205,15 +274,33 @@ def main() -> None:
     df["ai"] = df["ops_per_sec"] / df["bytes_per_sec"]
     df["perf"] = df["ops_per_sec"]
     perf_scale = args.perf_scale if args.perf_scale > 0 else 1.0
-    df["perf_plot"] = df["perf"] / perf_scale
+    if args.no_scale_perf:
+        plot_scale = 1.0
+    elif args.scale_perf or perf_scale != 1.0:
+        plot_scale = perf_scale
+    else:
+        plot_scale = 1.0
+    df["perf_plot"] = df["perf"] / plot_scale
 
     plt.figure(figsize=(8, 6))
     sizes = 30.0
     colors = None
-    if df["time_ns"].notna().any():
-        time_s = df["time_ns"].fillna(0) * 1e-9
+    cbar_label = None
+    time_s = None
+    if df["time_s"].notna().any():
+        time_s = df["time_s"].fillna(0)
         sizes = (time_s / max(time_s.max(), 1e-12) * 80.0) + 10.0
+    if args.score_by in {"memory_bw", "combined"}:
+        bw_col = "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"
+        if bw_col in df.columns and df[bw_col].notna().any():
+            colors = df[bw_col].fillna(0.0)
+            cbar_label = "Memory BW % of peak"
+        elif time_s is not None:
+            colors = time_s
+            cbar_label = "Duration (s)"
+    elif time_s is not None:
         colors = time_s
+        cbar_label = "Duration (s)"
     if colors is not None:
         order = colors.sort_values().index
         df_plot = df.loc[order]
@@ -235,7 +322,7 @@ def main() -> None:
     )
     if colors is not None:
         cbar = plt.colorbar(sc)
-        cbar.set_label("Duration (s)")
+        cbar.set_label(cbar_label or "Value")
     plt.xscale("log")
     plt.yscale("log")
     plt.xlabel("HW Arithmetic Intensity [FLOP/byte]")
@@ -269,14 +356,14 @@ def main() -> None:
         xmin = min(xmin/10.0, ridge_x / 100.0)
         xmax = max(xmax*10.0, ridge_x * 100.0)
         xs = [xmin, xmax]
-        mem_line = [(peak_bw * x) / perf_scale for x in xs]
-        comp_line = [peak_flops / perf_scale, peak_flops / perf_scale]
+        mem_line = [(peak_bw * x) / plot_scale for x in xs]
+        comp_line = [peak_flops / plot_scale, peak_flops / plot_scale]
         plt.plot(xs, mem_line, "--", color="orange", linewidth=1, label="Memory roof")
         plt.plot(xs, comp_line, "--", color="red", linewidth=1, label="Compute roof")
         plt.xlim(xmin, xmax)
         plt.ylim(
-            min(df["perf_plot"].min() / 10.0, (peak_flops / perf_scale) / 100.0),
-            (peak_flops / perf_scale) * 10.0,
+            min(df["perf_plot"].min() / 10.0, (peak_flops / plot_scale) / 100.0),
+            (peak_flops / plot_scale) * 10.0,
         )
         plt.legend(loc="best")
         for _, row in df.iterrows():
@@ -291,18 +378,20 @@ def main() -> None:
                 roof = peak_flops
             dist = max(roof - perf, 0.0)
             name = _row_name(row)
-            duration_s = row.get("time_ns", math.nan)
-            duration_s = 0.0 if math.isnan(duration_s) else duration_s * 1e-9
+            duration_s = row.get("time_s", math.nan)
+            duration_s = 0.0 if math.isnan(duration_s) else duration_s
             bw_pct = row.get("gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed", math.nan)
             bw_pct = 0.0 if math.isnan(bw_pct) else bw_pct
             if args.score_by == "memory_bw":
                 score = bw_pct / dist if dist > 0 else float("inf")
+            elif args.score_by == "combined":
+                score = (bw_pct * duration_s) / dist if dist > 0 else float("inf")
             else:
                 score = duration_s / dist if dist > 0 else float("inf")
             bound_rows.append((bound, dist, score, duration_s, bw_pct, name))
 
     if kernel_name_col and args.top_n > 0:
-        top = df.nlargest(args.top_n, "time_ns")
+        top = df.nlargest(args.top_n, "time_s")
         for _, row in top.iterrows():
             name = _row_name(row)
             plt.annotate(name, (row["ai"], row["perf"]), fontsize=7, alpha=0.8)
@@ -326,4 +415,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

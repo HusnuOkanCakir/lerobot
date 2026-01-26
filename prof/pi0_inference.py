@@ -9,11 +9,16 @@ from pathlib import Path
 import torch
 from torch.profiler import ProfilerActivity, profile, tensorboard_trace_handler
 
+try:
+    from torch.cuda import nvtx
+except Exception:
+    nvtx = None
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.processor import PolicyProcessorPipeline
+from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
 from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, POLICY_POSTPROCESSOR_DEFAULT_NAME
 
 
@@ -187,6 +192,41 @@ class LayerProfiler:
             print(f"{total:12.6f} {count:7d} {avg:12.6f} {tmin:12.6f} {tmax:12.6f}  {name}")
 
 
+class NvtxLayerRanges:
+    def __init__(self, leaf_only: bool = False) -> None:
+        self.leaf_only = leaf_only
+        self._handles: list[torch.utils.hooks.RemovableHandle] = []
+
+    def _is_leaf(self, module: torch.nn.Module) -> bool:
+        return len(list(module.children())) == 0
+
+    def _pre_hook(self, module: torch.nn.Module, _inputs) -> None:
+        if nvtx is None:
+            return
+        name = getattr(module, "_nvtx_name", module.__class__.__name__)
+        nvtx.range_push(name)
+
+    def _post_hook(self, module: torch.nn.Module, _inputs, _output) -> None:
+        if nvtx is None:
+            return
+        nvtx.range_pop()
+
+    def attach(self, module: torch.nn.Module, prefix: str = "model") -> None:
+        for name, child in module.named_modules():
+            if name == "":
+                continue
+            if self.leaf_only and not self._is_leaf(child):
+                continue
+            child._nvtx_name = f"{prefix}.{name}"
+            self._handles.append(child.register_forward_pre_hook(self._pre_hook))
+            self._handles.append(child.register_forward_hook(self._post_hook))
+
+    def detach(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a single PI0 inference on a dataset sample.")
     parser.add_argument(
@@ -220,6 +260,16 @@ def main() -> None:
         type=int,
         default=50,
         help="Number of layers to print in the timing report.",
+    )
+    parser.add_argument(
+        "--nvtx_layers",
+        action="store_true",
+        help="Emit NVTX ranges per module for Nsight profiling.",
+    )
+    parser.add_argument(
+        "--nvtx_leaf_only",
+        action="store_true",
+        help="Only emit NVTX ranges for leaf modules.",
     )
     parser.add_argument(
         "--warmup_iters",
@@ -267,6 +317,8 @@ def main() -> None:
         postprocessor = PolicyProcessorPipeline.from_pretrained(
             pretrained_model_name_or_path=args.checkpoint_path,
             config_filename=f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json",
+            to_transition=policy_action_to_transition,
+            to_output=transition_to_policy_action,
         )
     else:
         ds_meta = LeRobotDatasetMetadata(args.dataset_repo_id)
@@ -291,6 +343,14 @@ def main() -> None:
     if args.profile_layers:
         profiler = LayerProfiler(device=device, leaf_only=args.profile_leaf_only)
         profiler.attach(policy.model, prefix="policy.model")
+
+    nvtx_ranges = None
+    if args.nvtx_layers:
+        if nvtx is None:
+            print("[NVTX] torch.cuda.nvtx not available; NVTX ranges disabled.")
+        else:
+            nvtx_ranges = NvtxLayerRanges(leaf_only=args.nvtx_leaf_only)
+            nvtx_ranges.attach(policy.model, prefix="policy.model")
 
     prof_ctx = None
     if args.profile_trace:
@@ -344,6 +404,8 @@ def main() -> None:
     if profiler is not None:
         profiler.detach()
         profiler.report(top_n=args.profile_top_n)
+    if nvtx_ranges is not None:
+        nvtx_ranges.detach()
 
     if timings:
         avg = sum(timings) / len(timings)
