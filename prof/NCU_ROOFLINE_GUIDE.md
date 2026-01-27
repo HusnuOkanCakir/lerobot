@@ -79,12 +79,12 @@ ncu --nvtx --set roofline  --target-processes all  --replay-mode kernel --launch
 
 If you only want kernels within the VLM + expert ranges, add `--nvtx-include` filters.
 The NVTX names are visible in the exported `*_bounds.csv` and look like:
-`<default domain>:policy.model.vlm_with_expert...`
+`"regex:policy\\.model\\..*/"`
 
 Example (VLM + expert + action projections):
 ```
 ncu --nvtx --set roofline --target-processes all --replay-mode kernel --launch-count 200 \
-  --nvtx-include "<default domain>:policy.model.vlm_with_expert" \
+  --nvtx-include "regex:policy\\.model\\..*/" \
   -o prof/ncu_roofline_nvtx_vlm_expert_200l \
   -- python ./prof/smolvla_inference.py \
     --checkpoint_path outputs/train/my_smolvla/checkpoints/last/pretrained_model \
@@ -330,7 +330,9 @@ Loading weights from local directory
 ==WARNING== No kernels were profiled.
 
 
-
+mkdir -p /mnt/galactica/ocakir/tmp/ncu
+chmod 700 /mnt/galactica/ocakir/tmp /mnt/galactica/ocakir/tmp/ncu
+export TMPDIR=/mnt/galactica/ocakir/tmp/ncu
 
 
 
