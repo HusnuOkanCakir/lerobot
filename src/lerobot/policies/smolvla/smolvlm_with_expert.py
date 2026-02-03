@@ -24,6 +24,11 @@ from transformers import (
     SmolVLMForConditionalGeneration,
 )
 
+try:
+    from torch.cuda import nvtx
+except Exception:
+    nvtx = None
+
 
 def apply_rope(x, positions, max_wavelength=10_000):
     """
@@ -267,9 +272,13 @@ class SmolVLMWithExpertModel(nn.Module):
 
         attention_interface = self.get_attention_interface()
 
+        if nvtx is not None:
+            nvtx.range_push(f"BLOCK.attn.forward_attn_layer.{layer_idx}")
         att_output = attention_interface(
             attention_mask_, batch_size, head_dim, query_states, key_states, value_states
         )
+        if nvtx is not None:
+            nvtx.range_pop()
         return [att_output], past_key_values
 
     def forward_cross_attn_layer(
@@ -314,9 +323,13 @@ class SmolVLMWithExpertModel(nn.Module):
             query_states = apply_rope(query_state, position_id)
             key_states = apply_rope(key_state, position_id)
 
+            if nvtx is not None:
+                nvtx.range_push(f"BLOCK.attn.prefix.{layer_idx}")
             att_output = attention_interface(
                 prefix_attention_mask, batch_size, head_dim, query_states, key_states, value_states
             )
+            if nvtx is not None:
+                nvtx.range_pop()
             att_outputs.append(att_output)
         else:
             expert_position_id = position_ids
@@ -372,6 +385,8 @@ class SmolVLMWithExpertModel(nn.Module):
 
             expert_query_states = apply_rope(expert_query_state, expert_position_id)
 
+            if nvtx is not None:
+                nvtx.range_push(f"BLOCK.attn.expert.{layer_idx}")
             att_output = attention_interface(
                 expert_attention_mask,
                 batch_size,
@@ -380,6 +395,8 @@ class SmolVLMWithExpertModel(nn.Module):
                 expert_key_states,
                 expert_value_states,
             )
+            if nvtx is not None:
+                nvtx.range_pop()
             att_outputs.append(att_output)
         else:
             att_outputs.append(None)
@@ -476,7 +493,11 @@ class SmolVLMWithExpertModel(nn.Module):
                     after_first_residual = out_emb.clone()
 
                     out_emb = layer.post_attention_layernorm(out_emb)
+                    if nvtx is not None:
+                        nvtx.range_push(f"BLOCK.fc.mlp.{layer_idx}")
                     out_emb = layer.mlp(out_emb)
+                    if nvtx is not None:
+                        nvtx.range_pop()
 
                     out_emb += after_first_residual
 

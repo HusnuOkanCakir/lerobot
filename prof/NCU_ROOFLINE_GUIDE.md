@@ -147,6 +147,26 @@ ncu --nvtx --set roofline --target-processes all --replay-mode application --lau
     --nvtx_layers --nvtx_leaf_only
 ```
 
+
+/usr/local/cuda/bin/ncu -f --nvtx \
+  --nvtx-include "regex:.*attn.*/" \
+  --nvtx-include "regex:.*attention.*/" \
+  --nvtx-include "regex:.*fc.*/" \
+  --set roofline \
+  --target-processes all \
+  --replay-mode kernel \
+  -o /mnt/galactica/ocakir/smolvla/lerobot/prof/ncu_roofline_nvtx_fury0_pi0_full_launch_att_fc_bs1 \
+   python /mnt/galactica/ocakir/smolvla/lerobot/prof/pi0_inference.py \
+    --checkpoint_path lerobot/pi0_base \
+    --device cuda \
+    --warmup_iters 5 \
+    --profile_iters 20 \
+    --nvtx_layers \
+    --nvtx_leaf_only \
+    --fresh_batch_each_iter \
+    --time_preprocessor \
+    --batch_size 1
+
 ncu --nvtx --nvtx-include "regex:policy\\.model\\..*/" --set roofline --target-processes all --replay-mode kernel -o /mnt/galactica/ocakir/openpi/ncu_roofline_nvtx_fury0_pi0_full_launch_filtered python prof/pi0_inference.py --checkpoint_path lerobot/pi0_base --use_dummy_input --device cuda --warmup_iters 2 --profile_iters 1 --nvtx_layers --nvtx_leaf_only
 
 For fury0:

@@ -28,6 +28,11 @@ from typing_extensions import Unpack
 
 from lerobot.utils.import_utils import _transformers_available
 
+try:
+    from torch.cuda import nvtx
+except Exception:
+    nvtx = None
+
 # Conditional import for type checking and lazy loading
 if TYPE_CHECKING or _transformers_available:
     from transformers.models.auto import CONFIG_MAPPING
@@ -256,6 +261,8 @@ def compute_layer_complete(
     batch_size = query_states.shape[0]
     scaling = paligemma.language_model.layers[layer_idx].self_attn.scaling
     # Attention computation
+    if nvtx is not None:
+        nvtx.range_push(f"BLOCK.attn.compute_layer.{layer_idx}")
     att_output, _ = modeling_gemma.eager_attention_forward(
         paligemma.language_model.layers[layer_idx].self_attn,
         query_states,
@@ -264,6 +271,8 @@ def compute_layer_complete(
         attention_mask,
         scaling,
     )
+    if nvtx is not None:
+        nvtx.range_pop()
     # Get head_dim from the current layer, not from the model
     head_dim = paligemma.language_model.layers[layer_idx].self_attn.head_dim
     att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
@@ -283,7 +292,11 @@ def compute_layer_complete(
         # Convert to bfloat16 if the next layer (mlp) uses bfloat16
         if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
             out_emb = out_emb.to(dtype=torch.bfloat16)
+        if nvtx is not None:
+            nvtx.range_push(f"BLOCK.fc.mlp.{layer_idx}")
         out_emb = layer.mlp(out_emb)
+        if nvtx is not None:
+            nvtx.range_pop()
         # second residual
         out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
         outputs_embeds.append(out_emb)

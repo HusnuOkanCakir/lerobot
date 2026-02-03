@@ -69,6 +69,10 @@ def _unit_scale(unit: str) -> float:
         return 1e6
     if u in {"gbyte/s", "gbytes/s"}:
         return 1e9
+    if u in {"tbyte/s", "tbytes/s"}:
+        return 1e12
+    if u in {"pbyte/s", "pbytes/s"}:
+        return 1e15
     if u in {"byte/cycle", "bytes/cycle"}:
         return 1.0
     if u in {"kbyte/cycle", "kbytes/cycle"}:
@@ -77,6 +81,10 @@ def _unit_scale(unit: str) -> float:
         return 1e6
     if u in {"gbyte/cycle", "gbytes/cycle"}:
         return 1e9
+    if u in {"tbyte/cycle", "tbytes/cycle"}:
+        return 1e12
+    if u in {"pbyte/cycle", "pbytes/cycle"}:
+        return 1e15
     if u in {"ns"}:
         return 1e-9
     if u in {"us"}:
@@ -134,6 +142,7 @@ def _load_csv(csv_path: Path):
     if not bytes_cols:
         raise RuntimeError("No DRAM bytes columns found in the CSV.")
     bytes_col = bytes_cols[0]
+    bytes_is_rate = "per_second" in bytes_col
 
     cycles_cols = _pick_columns(
         header,
@@ -215,6 +224,8 @@ def _load_csv(csv_path: Path):
     time_col = "gpu__time_duration.sum"
     time_scale = _scale_col(time_col) if time_col in df.columns else 1.0
     df["time_s"] = df.get(time_col, pd.Series([math.nan] * len(df))).map(_to_float) * time_scale
+    if not bytes_is_rate:
+        df["bytes_per_sec"] = df["bytes_per_sec"] / df["time_s"].replace(0, math.nan)
     df = df[(df["ops_per_sec"] > 0) & (df["bytes_per_sec"] > 0)].copy()
     if df.empty:
         raise RuntimeError("No valid rows found after filtering.")
@@ -249,6 +260,9 @@ def _aggregate_category(df: pd.DataFrame, mask: pd.Series):
     sub = df[mask].copy()
     if sub.empty:
         return None
+    sub = sub[sub["time_s"].notna()].copy()
+    if sub.empty:
+        return None
     ops = (sub["ops_per_sec"] * sub["time_s"]).sum()
     bytes_ = (sub["bytes_per_sec"] * sub["time_s"]).sum()
     time = sub["time_s"].sum()
@@ -258,8 +272,41 @@ def _aggregate_category(df: pd.DataFrame, mask: pd.Series):
     perf = ops / time
     bw_pct = None
     if "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed" in sub.columns:
-        bw_pct = sub["gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"].mean()
+        weights = sub["time_s"].fillna(0)
+        if weights.sum() > 0:
+            bw_pct = (sub["gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"] * weights).sum() / weights.sum()
+        else:
+            bw_pct = sub["gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"].mean()
     return {"ai": ai, "perf": perf, "time": time, "bw_pct": bw_pct}
+
+
+def _bounds_rank_map(bounds_path: Path) -> dict[str, int]:
+    if not bounds_path.exists():
+        return {}
+    bounds_df = pd.read_csv(bounds_path)
+    if "name" not in bounds_df.columns:
+        return {}
+    names = bounds_df["name"].astype(str).tolist()
+    return {name: idx for idx, name in enumerate(names)}
+
+
+def _normalize_name(name: str) -> str:
+    s = str(name).strip().strip('"')
+    s = re.sub(r'^\d+\s+', '', s)
+    s = re.sub(r'\s+', ' ', s)
+    return s
+
+
+def _row_rank(row_name: str, bounds_names: list[str]) -> int | None:
+    norm_row = _normalize_name(row_name)
+    norm_bounds = [_normalize_name(n) for n in bounds_names]
+    for idx, name in enumerate(norm_bounds):
+        if norm_row == name:
+            return idx
+    for idx, name in enumerate(norm_bounds):
+        if norm_row in name or name in norm_row:
+            return idx
+    return None
 
 
 def main() -> None:
@@ -274,9 +321,25 @@ def main() -> None:
     parser.add_argument("--scale-perf", action="store_true", help="Divide performance by --perf-scale.")
     parser.add_argument("--no-scale-perf", action="store_true", help="Do not scale performance values.")
     parser.add_argument(
+        "--model",
+        choices=["smolvla", "pi0"],
+        default="smolvla",
+        help="Select default attention/FC regex presets.",
+    )
+    parser.add_argument(
         "--out-points",
         default="",
         help="Optional CSV output with plotted points.",
+    )
+    parser.add_argument(
+        "--heatmap",
+        action="store_true",
+        help="Color points by bounds rank heat (single input only).",
+    )
+    parser.add_argument(
+        "--dot-size-time",
+        action="store_true",
+        help="Size dots by time_s instead of memory BW percent.",
     )
     parser.add_argument(
         "--aggregate-attn-fc",
@@ -286,16 +349,39 @@ def main() -> None:
     parser.add_argument(
         "--attn-regex",
         action="append",
-        default=[r"\.self_attn\.", r"post_attention_layernorm"],
+        default=None,
         help="Regex for attention block matching (repeatable).",
     )
     parser.add_argument(
         "--fc-regex",
         action="append",
-        default=[r"\.mlp\.", r"\.mlp\.fc\d+", r"action_.*_proj", r"state_proj"],
+        default=None,
         help="Regex for FC/MLP block matching (repeatable).",
     )
     args = parser.parse_args()
+
+    if args.attn_regex is None:
+        args.attn_regex = [r"attn", r"attention"]
+    if args.fc_regex is None:
+        if args.model == "pi0":
+            args.fc_regex = [
+                r"embedding",
+                r"mlp",
+                # r"\.mlp\.fc\d+",
+                # r"action_.*_proj",
+                # r"state_proj",
+                r"fc",
+            ]
+        else:
+            args.fc_regex = [
+                r"embedding",
+                r"mlp",
+                # r"\.mlp\.fc\d+",
+                # r"action_.*_proj",
+                # r"state_proj",
+                r"fc",
+                
+            ]
 
     ncu_bin = shutil.which(args.ncu) if args.ncu == "ncu" else args.ncu
     if not ncu_bin:
@@ -330,7 +416,7 @@ def main() -> None:
     else:
         plot_scale = 1.0
 
-    plt.figure(figsize=(8, 6))
+    fig, ax = plt.subplots(figsize=(8, 6))
     colors = plt.get_cmap("tab10")
     size_by_bw = False
     points_rows = []
@@ -354,7 +440,7 @@ def main() -> None:
                         "mem_bw_pct": attn["bw_pct"],
                     }
                 )
-                plt.scatter(
+                ax.scatter(
                     [attn["ai"]],
                     [attn["perf"] / plot_scale],
                     s=120,
@@ -375,7 +461,7 @@ def main() -> None:
                         "mem_bw_pct": fc["bw_pct"],
                     }
                 )
-                plt.scatter(
+                ax.scatter(
                     [fc["ai"]],
                     [fc["perf"] / plot_scale],
                     s=120,
@@ -387,8 +473,33 @@ def main() -> None:
                 )
         size_label = "Point size = fixed (aggregated)"
     else:
+        attn_patterns = [re.compile(p) for p in args.attn_regex]
+        fc_patterns = [re.compile(p) for p in args.fc_regex]
+        heat_colors = None
+        if args.heatmap and len(series) == 1:
+            rep_path = Path(args.rep[0])
+            if rep_path.suffix == ".ncu-rep":
+                bounds_path = rep_path.parent / rep_path.stem / f"{rep_path.stem}_bounds.csv"
+            else:
+                bounds_path = rep_path.with_name(f"{rep_path.stem}_bounds.csv")
+            bounds_map = _bounds_rank_map(bounds_path)
+            bounds_names = list(bounds_map.keys())
+            if bounds_names:
+                ranks = []
+                for name in series[0][1]["row_name"].astype(str):
+                    rank = _row_rank(name, bounds_names)
+                    ranks.append(rank if rank is not None else len(bounds_names))
+                ranks = pd.Series(ranks)
+                denom = max(len(bounds_names) - 1, 1)
+                heat = 1.0 - (ranks / denom)
+                cmap = plt.get_cmap("hot")
+                heat_colors = cmap(heat.clip(0.0, 1.0))
         for idx, (label, df, _peaks) in enumerate(series):
-            if "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed" in df.columns:
+            names = df["row_name"].astype(str)
+            attn_mask = names.apply(lambda s: any(p.search(s) for p in attn_patterns))
+            fc_mask = names.apply(lambda s: any(p.search(s) for p in fc_patterns))
+            other_mask = ~(attn_mask | fc_mask)
+            if not args.dot_size_time and "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed" in df.columns:
                 bw_pct = df["gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"].fillna(0)
                 sizes = (bw_pct / max(bw_pct.max(), 1e-12) * 80.0) + 10.0
                 size_by_bw = True
@@ -407,17 +518,31 @@ def main() -> None:
                         "mem_bw_pct": bw,
                     }
                 )
-            plt.scatter(
-                df["ai"],
-                df["perf"] / plot_scale,
-                s=sizes,
-                c=[colors(idx % 10)],
-                alpha=0.7,
-                edgecolors="black",
-                linewidths=0.3,
-                label=label,
-            )
+            def _plot_subset(mask, marker, suffix):
+                if not mask.any():
+                    return
+                ax.scatter(
+                    df.loc[mask, "ai"],
+                    df.loc[mask, "perf"] / plot_scale,
+                    s=pd.Series(sizes).loc[mask],
+                    c=(heat_colors[mask] if heat_colors is not None else [colors(idx % 10)]),
+                    alpha=0.7,
+                    edgecolors="black",
+                    linewidths=0.3,
+                    marker=marker,
+                    label=f"{label} {suffix}",
+                )
+
+            _plot_subset(attn_mask, "^", "attn")
+            _plot_subset(fc_mask, "o", "fc")
+            _plot_subset(other_mask, "x", "other")
         size_label = "Point size = memory BW % of peak" if size_by_bw else "Point size = duration (s)"
+
+        if heat_colors is not None:
+            sm = plt.cm.ScalarMappable(cmap=plt.get_cmap("hot"), norm=plt.Normalize(vmin=0, vmax=1))
+            sm.set_array([])
+            cbar = fig.colorbar(sm, ax=ax)
+            cbar.set_label("Bounds rank (higher = more memory bounded)")
 
     if peak_bw and peak_flops:
         ridge_x = peak_flops / peak_bw
@@ -428,34 +553,34 @@ def main() -> None:
         xs = [xmin, xmax]
         mem_line = [(peak_bw * x) / plot_scale for x in xs]
         comp_line = [peak_flops / plot_scale, peak_flops / plot_scale]
-        plt.plot(xs, mem_line, "--", color="orange", linewidth=1, label="Memory roof")
-        plt.plot(xs, comp_line, "--", color="red", linewidth=1, label="Compute roof")
-        plt.xlim(xmin, xmax)
-        plt.ylim(
+        ax.plot(xs, mem_line, "--", color="orange", linewidth=1, label="Memory roof")
+        ax.plot(xs, comp_line, "--", color="red", linewidth=1, label="Compute roof")
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(
             min(min(d["perf"].min() for _, d, _ in series) / plot_scale / 10.0, (peak_flops / plot_scale) / 100.0),
             (peak_flops / plot_scale) * 10.0,
         )
 
-    plt.xscale("log")
-    plt.yscale("log")
-    plt.xlabel("HW Arithmetic Intensity [FLOP/byte]")
-    plt.ylabel(f"HW Performance [FLOP/s] (1 = {perf_scale:.0e})")
-    plt.title("Multi-run Roofline")
-    plt.gca().text(
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("HW Arithmetic Intensity [FLOP/byte]")
+    ax.set_ylabel(f"HW Performance [FLOP/s] (1 = {perf_scale:.0e})")
+    ax.set_title("Multi-run Roofline")
+    ax.text(
         0.02,
         0.02,
         size_label,
-        transform=plt.gca().transAxes,
+        transform=ax.transAxes,
         fontsize=8,
         alpha=0.8,
         va="bottom",
     )
-    plt.legend(loc="best")
+    ax.legend(loc="best")
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
     print(f"Wrote {out_path}")
 
     if args.out_points:

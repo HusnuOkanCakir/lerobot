@@ -6,6 +6,7 @@ from collections import defaultdict
 import json
 import csv
 from pathlib import Path
+import re
 
 import torch
 from torch.profiler import ProfilerActivity, profile, tensorboard_trace_handler
@@ -214,6 +215,78 @@ class NvtxLayerRanges:
         self._handles.clear()
 
 
+class BlockLatencyProfiler:
+    def __init__(self, device: str, attn_patterns: list[str], fc_patterns: list[str]) -> None:
+        self.device = device
+        self._attn_re = [re.compile(p) for p in attn_patterns]
+        self._fc_re = [re.compile(p) for p in fc_patterns]
+        self._handles: list[torch.utils.hooks.RemovableHandle] = []
+        self._module_category: dict[int, str] = {}
+        self._start: dict[int, object] = {}
+        self._events: list[tuple[str, object, object]] = []
+
+    def _match(self, name: str) -> str | None:
+        if any(r.search(name) for r in self._attn_re):
+            return "attn"
+        if any(r.search(name) for r in self._fc_re):
+            return "fc"
+        return None
+
+    def _pre_hook(self, module: torch.nn.Module, _inputs) -> None:
+        if self.device == "cuda" and torch.cuda.is_available():
+            evt = torch.cuda.Event(enable_timing=True)
+            evt.record()
+            self._start[id(module)] = evt
+        else:
+            self._start[id(module)] = time.perf_counter()
+
+    def _post_hook(self, module: torch.nn.Module, _inputs, _output) -> None:
+        start = self._start.get(id(module))
+        if start is None:
+            return
+        if self.device == "cuda" and torch.cuda.is_available():
+            end = torch.cuda.Event(enable_timing=True)
+            end.record()
+            self._events.append((self._module_category[id(module)], start, end))
+        else:
+            end = time.perf_counter()
+            self._events.append((self._module_category[id(module)], start, end))
+
+    def attach(self, module: torch.nn.Module, prefix: str = "model") -> None:
+        for name, child in module.named_modules():
+            if name == "":
+                continue
+            full_name = f"{prefix}.{name}"
+            category = self._match(full_name)
+            if category is None:
+                continue
+            self._module_category[id(child)] = category
+            self._handles.append(child.register_forward_pre_hook(self._pre_hook))
+            self._handles.append(child.register_forward_hook(self._post_hook))
+
+    def detach(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+        self._module_category.clear()
+        self._start.clear()
+        self._events.clear()
+
+    def begin_iter(self) -> None:
+        self._events.clear()
+
+    def end_iter(self) -> dict[str, float]:
+        totals_ms = {"attn": 0.0, "fc": 0.0}
+        if self.device == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            for category, start_evt, end_evt in self._events:
+                totals_ms[category] += start_evt.elapsed_time(end_evt)
+        else:
+            for category, start_t, end_t in self._events:
+                totals_ms[category] += (end_t - start_t) * 1000.0
+        return totals_ms
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a single SmolVLA inference on a dataset sample.")
     parser.add_argument(
@@ -262,6 +335,33 @@ def main() -> None:
         "--iter_plot",
         default="",
         help="Output PNG for per-iteration latency plot (default: prof/iter_latencies.png).",
+    )
+    parser.add_argument(
+        "--profile_blocks",
+        action="store_true",
+        help="Measure attention/FC block latency with forward hooks.",
+    )
+    parser.add_argument(
+        "--attn_regex",
+        action="append",
+        default=[r"\.self_attn\.", r"attention", r"attn"],
+        help="Regex for attention block matching (repeatable).",
+    )
+    parser.add_argument(
+        "--fc_regex",
+        action="append",
+        default=[r"\.mlp\.", r"\.mlp\.fc\d+", r"\.mlp\.(gate|up|down)_proj", r"action_.*_proj", r"state_proj"],
+        help="Regex for FC/MLP block matching (repeatable).",
+    )
+    parser.add_argument(
+        "--block_lat_csv",
+        default="",
+        help="Output CSV for per-iteration block latencies (default: prof/block_latencies.csv).",
+    )
+    parser.add_argument(
+        "--block_lat_plot",
+        default="",
+        help="Output PNG for per-iteration block latency plot (default: prof/block_latencies.png).",
     )
     parser.add_argument(
         "--profile_layers",
@@ -378,6 +478,12 @@ def main() -> None:
             nvtx_ranges = NvtxLayerRanges(leaf_only=args.nvtx_leaf_only)
             nvtx_ranges.attach(policy.model, prefix="policy.model")
 
+    block_profiler = None
+    block_latencies: list[dict[str, float]] = []
+    if args.profile_blocks:
+        block_profiler = BlockLatencyProfiler(device, args.attn_regex, args.fc_regex)
+        block_profiler.attach(policy.model, prefix="policy.model")
+
     prof_ctx = None
     if args.profile_trace:
         activities = [ProfilerActivity.CPU]
@@ -431,6 +537,8 @@ def main() -> None:
                     elif device == "mps" and torch.backends.mps.is_available():
                         torch.mps.synchronize()
                 start = time.perf_counter()
+                if block_profiler is not None:
+                    block_profiler.begin_iter()
                 if args.fresh_batch_each_iter and args.time_preprocessor:
                     sample = _next_sample()
                     batch = preprocessor(sample)
@@ -443,6 +551,20 @@ def main() -> None:
                 end = time.perf_counter()
                 elapsed = end - start
                 timings.append(elapsed)
+                if block_profiler is not None:
+                    totals_ms = block_profiler.end_iter()
+                    batch_ms = elapsed * 1000.0
+                    other_ms = max(batch_ms - totals_ms["attn"] - totals_ms["fc"], 0.0)
+                    block_latencies.append(
+                        {
+                            "iter": float(i),
+                            "batch_ms": batch_ms,
+                            "attn_ms": totals_ms["attn"],
+                            "fc_ms": totals_ms["fc"],
+                            "other_ms": other_ms,
+                            "batch_size": float(batch_size),
+                        }
+                    )
                 if print_iter:
                     per_sample = elapsed / batch_size
                     print(
@@ -496,6 +618,51 @@ def main() -> None:
         fig.savefig(out_path)
         plt.close(fig)
         print(f"[SimpleInference] Wrote iter plot: {out_path}")
+
+    def _write_block_latency(block_rows: list[dict[str, float]]) -> None:
+        if not block_rows:
+            return
+        out_csv = Path(args.block_lat_csv) if args.block_lat_csv else Path("prof/block_latencies.csv")
+        out_plot = Path(args.block_lat_plot) if args.block_lat_plot else Path("prof/block_latencies.png")
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        with out_csv.open("w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["iter", "batch_ms", "attn_ms", "fc_ms", "other_ms", "batch_size"])
+            for row in block_rows:
+                writer.writerow(
+                    [
+                        int(row["iter"]),
+                        f"{row['batch_ms']:.6f}",
+                        f"{row['attn_ms']:.6f}",
+                        f"{row['fc_ms']:.6f}",
+                        f"{row['other_ms']:.6f}",
+                        int(row["batch_size"]),
+                    ]
+                )
+        try:
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            print(f"[BlockLatency] Plot skipped (matplotlib unavailable): {exc}")
+            print(f"[BlockLatency] Wrote block latency CSV: {out_csv}")
+            return
+        out_plot.parent.mkdir(parents=True, exist_ok=True)
+        xs = [int(r["iter"]) for r in block_rows]
+        attn = [r["attn_ms"] for r in block_rows]
+        fc = [r["fc_ms"] for r in block_rows]
+        other = [r["other_ms"] for r in block_rows]
+        fig, ax = plt.subplots(figsize=(7.5, 4.5))
+        ax.bar(xs, fc, label="FC", color="#4c78a8")
+        ax.bar(xs, attn, bottom=fc, label="Attention", color="#f58518")
+        ax.bar(xs, other, bottom=[f + a for f, a in zip(fc, attn)], label="Other", color="#9e9e9e")
+        ax.set_xlabel("iter")
+        ax.set_ylabel("latency per batch (ms)")
+        ax.set_title(f"SmolVLA block latency (batch_size={int(block_rows[0]['batch_size'])})")
+        ax.legend(loc="upper left")
+        fig.tight_layout()
+        fig.savefig(out_plot)
+        plt.close(fig)
+        print(f"[BlockLatency] Wrote block latency CSV: {out_csv}")
+        print(f"[BlockLatency] Wrote block latency plot: {out_plot}")
 
     def _summarize(timings: list[float], batch_size: int) -> None:
         if timings:
@@ -576,10 +743,13 @@ def main() -> None:
         profiler.report(top_n=args.profile_top_n)
     if nvtx_ranges is not None:
         nvtx_ranges.detach()
+    if block_profiler is not None:
+        block_profiler.detach()
 
     _summarize(timings, args.batch_size)
     _write_iter_csv(timings, args.batch_size)
     _write_iter_plot(timings, args.batch_size)
+    _write_block_latency(block_latencies)
     print(f"[SimpleInference] Action shape: {tuple(action.shape)}")
     print(f"[SimpleInference] Action (unnormalized): {action}")
 

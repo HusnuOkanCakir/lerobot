@@ -69,6 +69,10 @@ def _unit_scale(unit: str) -> float:
         return 1e6
     if u in {"gbyte/s", "gbytes/s"}:
         return 1e9
+    if u in {"tbyte/s", "tbytes/s"}:
+        return 1e12
+    if u in {"pbyte/s", "pbytes/s"}:
+        return 1e15
     if u in {"byte/cycle", "bytes/cycle"}:
         return 1.0
     if u in {"kbyte/cycle", "kbytes/cycle"}:
@@ -77,6 +81,10 @@ def _unit_scale(unit: str) -> float:
         return 1e6
     if u in {"gbyte/cycle", "gbytes/cycle"}:
         return 1e9
+    if u in {"tbyte/cycle", "tbytes/cycle"}:
+        return 1e12
+    if u in {"pbyte/cycle", "pbytes/cycle"}:
+        return 1e15
     if u in {"ns"}:
         return 1e-9
     if u in {"us"}:

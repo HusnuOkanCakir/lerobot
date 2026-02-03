@@ -1,0 +1,20 @@
+  if args.attn_regex is None:
+        args.attn_regex = [r"\.self_attn\.", r"post_attention_layernorm", r"input_layernorm", r"modality_projection"]
+    if args.fc_regex is None:
+        if args.model == "pi0":
+            args.fc_regex = [
+                r"mlp",
+                r"\.mlp\.fc\d+",
+                r"action_.*_proj",
+                r"state_proj",
+            ]
+        else:
+            args.fc_regex = [
+                r"embedding",
+                r"mlp",
+                r"\.mlp\.fc\d+",
+                r"action_.*_proj",
+                r"state_proj",
+                r""
+                
+            ]
