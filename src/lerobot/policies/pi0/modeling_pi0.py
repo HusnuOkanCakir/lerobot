@@ -15,9 +15,12 @@
 # limitations under the License.
 
 import builtins
+import json
 import logging
 import math
+import os
 from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict
 
@@ -28,10 +31,36 @@ from typing_extensions import Unpack
 
 from lerobot.utils.import_utils import _transformers_available
 
+# Dump PI0 trace info once if requested (env PI0_DUMP_DIR set)
+_PI0_ATTN_SHAPE_DUMPED = False
+_PI0_NVTX_STAGE: str | None = None
+
 try:
     from torch.cuda import nvtx
 except Exception:
     nvtx = None
+
+
+def _pi0_nvtx_block_tag(tag: str) -> str:
+    stage = _PI0_NVTX_STAGE
+    if stage and tag.startswith("BLOCK."):
+        return f"{tag}.stage.{stage}"
+    return tag
+
+
+@contextmanager
+def _pi0_nvtx_stage(name: str):
+    global _PI0_NVTX_STAGE
+    prev = _PI0_NVTX_STAGE
+    _PI0_NVTX_STAGE = name
+    if nvtx is not None:
+        nvtx.range_push(f"PI0.stage.{name}")
+    try:
+        yield
+    finally:
+        if nvtx is not None:
+            nvtx.range_pop()
+        _PI0_NVTX_STAGE = prev
 
 # Conditional import for type checking and lazy loading
 if TYPE_CHECKING or _transformers_available:
@@ -231,6 +260,8 @@ def compute_layer_complete(
     key_states = []
     value_states = []
     gates = []
+    if nvtx is not None:
+        nvtx.range_push(_pi0_nvtx_block_tag(f"BLOCK.fc.qkv.{layer_idx}"))
     for i, hidden_states in enumerate(inputs_embeds):
         layer = models[i].layers[layer_idx]
         hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
@@ -243,10 +274,31 @@ def compute_layer_complete(
         query_states.append(query_state)
         key_states.append(key_state)
         value_states.append(value_state)
+    if nvtx is not None:
+        nvtx.range_pop()
     # Concatenate and process attention
     query_states = torch.cat(query_states, dim=2)
     key_states = torch.cat(key_states, dim=2)
     value_states = torch.cat(value_states, dim=2)
+    global _PI0_ATTN_SHAPE_DUMPED
+    if not _PI0_ATTN_SHAPE_DUMPED:
+        dump_dir = os.environ.get("PI0_DUMP_DIR")
+        if dump_dir:
+            try:
+                payload = {
+                    "query_shape": list(query_states.shape),
+                    "key_shape": list(key_states.shape),
+                    "value_shape": list(value_states.shape),
+                    "dtype": str(query_states.dtype),
+                    "num_heads": int(query_states.shape[1]),
+                    "head_dim": int(query_states.shape[-1]),
+                    "seqlen": int(query_states.shape[2]),
+                    "batch_size": int(query_states.shape[0]),
+                }
+                _update_dump_info(dump_dir, payload)
+                _PI0_ATTN_SHAPE_DUMPED = True
+            except Exception as exc:
+                logging.getLogger(__name__).warning("PI0 attention shape dump failed: %s", exc)
     dummy_tensor = torch.zeros(
         query_states.shape[0],
         query_states.shape[2],
@@ -262,7 +314,7 @@ def compute_layer_complete(
     scaling = paligemma.language_model.layers[layer_idx].self_attn.scaling
     # Attention computation
     if nvtx is not None:
-        nvtx.range_push(f"BLOCK.attn.compute_layer.{layer_idx}")
+        nvtx.range_push(_pi0_nvtx_block_tag(f"BLOCK.attn.core_layer.{layer_idx}"))
     att_output, _ = modeling_gemma.eager_attention_forward(
         paligemma.language_model.layers[layer_idx].self_attn,
         query_states,
@@ -284,7 +336,11 @@ def compute_layer_complete(
         end_pos = start_pos + hidden_states.shape[1]
         if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
             att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+        if nvtx is not None:
+            nvtx.range_push(_pi0_nvtx_block_tag(f"BLOCK.fc.proj.{layer_idx}"))
         out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
+        if nvtx is not None:
+            nvtx.range_pop()
         # first residual
         out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
         after_first_residual = out_emb.clone()
@@ -293,7 +349,7 @@ def compute_layer_complete(
         if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
             out_emb = out_emb.to(dtype=torch.bfloat16)
         if nvtx is not None:
-            nvtx.range_push(f"BLOCK.fc.mlp.{layer_idx}")
+            nvtx.range_push(_pi0_nvtx_block_tag(f"BLOCK.fc.mlp.{layer_idx}"))
         out_emb = layer.mlp(out_emb)
         if nvtx is not None:
             nvtx.range_pop()
@@ -302,6 +358,23 @@ def compute_layer_complete(
         outputs_embeds.append(out_emb)
         start_pos = end_pos
     return outputs_embeds
+
+
+def _update_dump_info(dump_dir: str, payload: dict) -> None:
+    os.makedirs(dump_dir, exist_ok=True)
+    info_path = os.path.join(dump_dir, "pi0_attn_info.json")
+    data = {}
+    if os.path.exists(info_path):
+        try:
+            with open(info_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    data.update(payload)
+    with open(info_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
 
 
 class GemmaConfig:  # see openpi `gemma.py: Config`
@@ -571,6 +644,8 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             freeze_vision_encoder=config.freeze_vision_encoder,
             train_expert_only=config.train_expert_only,
         )
+        self._nvtx_handles: list[torch.utils.hooks.RemovableHandle] = []
+        self._register_block_hooks()
 
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
@@ -581,6 +656,11 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
+        self._dump_dir = os.environ.get("PI0_DUMP_DIR")
+        self._dump_masks_enabled = bool(self._dump_dir)
+        # Avoid mask dumping in compiled mode to keep graph capture stable.
+        if self.config.compile_model:
+            self._dump_masks_enabled = False
 
         # Compile model if requested
         if config.compile_model:
@@ -615,6 +695,63 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
         logging.info("Disabled gradient checkpointing for PI0Pytorch model")
 
+    def _register_block_hooks(self) -> None:
+        if nvtx is None:
+            return
+        if _transformers_available:
+            try:
+                orig = modeling_gemma.eager_attention_forward
+                if not getattr(orig, "_lerobot_nvtx_wrapped", False):
+                    def wrapped(module, *args, **kwargs):
+                        layer_idx = getattr(module, "layer_idx", None)
+                        tag = f"BLOCK.attn.core_layer.{layer_idx}" if layer_idx is not None else "BLOCK.attn.core"
+                        nvtx.range_push(_pi0_nvtx_block_tag(tag))
+                        try:
+                            return orig(module, *args, **kwargs)
+                        finally:
+                            nvtx.range_pop()
+
+                    wrapped._lerobot_nvtx_wrapped = True
+                    modeling_gemma.eager_attention_forward = wrapped
+            except Exception:
+                pass
+
+        def wrap_module(module: nn.Module, tag: str) -> None:
+            def _pre_hook(_mod, _inputs):
+                nvtx.range_push(_pi0_nvtx_block_tag(tag))
+                return None
+
+            def _post_hook(_mod, _inputs, _output):
+                nvtx.range_pop()
+
+            self._nvtx_handles.append(module.register_forward_pre_hook(_pre_hook))
+            self._nvtx_handles.append(module.register_forward_hook(_post_hook))
+
+        def register_layer(layer: nn.Module, layer_idx: int) -> None:
+            attn = layer.self_attn
+            q_tag = f"BLOCK.fc.qkv.{layer_idx}"
+            proj_tag = f"BLOCK.fc.proj.{layer_idx}"
+            mlp_tag = f"BLOCK.fc.mlp.{layer_idx}"
+
+            # Span q/k/v by pushing at q_proj and popping at v_proj.
+            def _qkv_pre(_mod, _inputs):
+                nvtx.range_push(_pi0_nvtx_block_tag(q_tag))
+                return None
+
+            def _qkv_post(_mod, _inputs, _output):
+                nvtx.range_pop()
+
+            self._nvtx_handles.append(attn.q_proj.register_forward_pre_hook(_qkv_pre))
+            self._nvtx_handles.append(attn.v_proj.register_forward_hook(_qkv_post))
+
+            wrap_module(attn.o_proj, proj_tag)
+            wrap_module(layer.mlp, mlp_tag)
+
+        for idx, layer in enumerate(self.paligemma_with_expert.paligemma.language_model.layers):
+            register_layer(layer, idx)
+        for idx, layer in enumerate(self.paligemma_with_expert.gemma_expert.model.layers):
+            register_layer(layer, idx)
+
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
@@ -625,6 +762,41 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 func, *args, use_reentrant=False, preserve_rng_state=False, **kwargs
             )
         return func(*args, **kwargs)
+
+    def _maybe_dump_masks(self, lang_masks: torch.Tensor, img_token_mask: torch.Tensor) -> None:
+        if not self._dump_masks_enabled:
+            return
+        if getattr(self, "_pi0_masks_dumped", False):
+            return
+        out_dir = self._dump_dir or "/tmp"
+        os.makedirs(out_dir, exist_ok=True)
+        lang_path = os.path.join(out_dir, "lang_masks.npy")
+        img_path = os.path.join(out_dir, "img_token_mask.npy")
+        if os.path.exists(lang_path) and os.path.exists(img_path):
+            self._pi0_masks_dumped = True
+            return
+        try:
+            import numpy as np  # type: ignore
+
+            np.save(lang_path, lang_masks.detach().cpu().numpy())
+            np.save(img_path, img_token_mask.detach().cpu().numpy())
+            self._pi0_masks_dumped = True
+            info_payload = {
+                "lang_len": int(lang_masks.shape[1]),
+                "num_img_tokens": int(img_token_mask.shape[1]),
+                "chunk_size": int(self.config.chunk_size),
+                "seqlen": int(lang_masks.shape[1] + img_token_mask.shape[1] + 1 + self.config.chunk_size),
+                "batch_size": int(lang_masks.shape[0]),
+                "num_layers": int(self.paligemma_with_expert.paligemma.language_model.config.num_hidden_layers),
+                "paligemma_variant": str(self.config.paligemma_variant),
+            }
+            if self._dump_dir:
+                _update_dump_info(self._dump_dir, info_payload)
+            logging.getLogger(__name__).info(
+                "PI0 masks dumped to %s and %s", lang_path, img_path
+            )
+        except Exception as exc:
+            logging.getLogger(__name__).warning("PI0 mask dump failed: %s", exc)
 
     def _prepare_attention_masks_4d(self, att_2d_masks):
         """Helper method to prepare 4D attention masks for transformer."""
@@ -770,6 +942,11 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks
         )
+        if lang_masks is not None and self._dump_masks_enabled:
+            num_lang = lang_masks.shape[1]
+            num_img_tokens = max(prefix_pad_masks.shape[1] - num_lang, 0)
+            img_token_mask = prefix_pad_masks[:, :num_img_tokens]
+            self._maybe_dump_masks(lang_masks, img_token_mask)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
 
         if (
@@ -843,19 +1020,25 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks
         )
+        if lang_masks is not None and self._dump_masks_enabled:
+            num_lang = lang_masks.shape[1]
+            num_img_tokens = max(prefix_pad_masks.shape[1] - num_lang, 0)
+            img_token_mask = prefix_pad_masks[:, :num_img_tokens]
+            self._maybe_dump_masks(lang_masks, img_token_mask)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
+        with _pi0_nvtx_stage("sum"):
+            _, past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=prefix_att_2d_masks_4d,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+            )
 
         dt = -1.0 / num_steps
 
@@ -921,14 +1104,15 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        outputs_embeds, _ = self.paligemma_with_expert.forward(
-            attention_mask=full_att_2d_masks_4d,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=[None, suffix_embs],
-            use_cache=False,
-            adarms_cond=[None, adarms_cond],
-        )
+        with _pi0_nvtx_stage("gen"):
+            outputs_embeds, _ = self.paligemma_with_expert.forward(
+                attention_mask=full_att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[None, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
 
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]

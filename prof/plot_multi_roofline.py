@@ -100,6 +100,10 @@ def _pick_columns(header: list[str], candidates: list[str]) -> list[str]:
     return [c for c in candidates if c in header]
 
 
+def _display_stem_name(stem: str) -> str:
+    return re.sub(r"^\d{8}_\d{6}_", "", stem)
+
+
 def _export_rep(rep_path: Path, ncu_bin: str) -> Path:
     out_dir = rep_path.parent / rep_path.stem
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -347,6 +351,16 @@ def main() -> None:
         help="Aggregate attention and FC/MLP kernels into two points per input file.",
     )
     parser.add_argument(
+        "--aggregate-stage-attn-fc",
+        action="store_true",
+        help="Aggregate into four points per input file: sum/gen x attn/fc (requires stage-tagged NVTX names).",
+    )
+    parser.add_argument(
+        "--attn-sub-split",
+        action="store_true",
+        help="When used with --aggregate-stage-attn-fc, split attention into attn_gemm vs attn_other.",
+    )
+    parser.add_argument(
         "--attn-regex",
         action="append",
         default=None,
@@ -358,30 +372,28 @@ def main() -> None:
         default=None,
         help="Regex for FC/MLP block matching (repeatable).",
     )
+    parser.add_argument(
+        "--sum-stage-regex",
+        action="append",
+        default=None,
+        help="Regex for PI0 summarization-stage matching in NVTX row names (repeatable).",
+    )
+    parser.add_argument(
+        "--gen-stage-regex",
+        action="append",
+        default=None,
+        help="Regex for PI0 generation-stage matching in NVTX row names (repeatable).",
+    )
     args = parser.parse_args()
 
     if args.attn_regex is None:
-        args.attn_regex = [r"attn", r"attention"]
+        args.attn_regex = [r"BLOCK\.attn\."]
     if args.fc_regex is None:
-        if args.model == "pi0":
-            args.fc_regex = [
-                r"embedding",
-                r"mlp",
-                # r"\.mlp\.fc\d+",
-                # r"action_.*_proj",
-                # r"state_proj",
-                r"fc",
-            ]
-        else:
-            args.fc_regex = [
-                r"embedding",
-                r"mlp",
-                # r"\.mlp\.fc\d+",
-                # r"action_.*_proj",
-                # r"state_proj",
-                r"fc",
-                
-            ]
+        args.fc_regex = [r"BLOCK\.fc\."]
+    if args.sum_stage_regex is None:
+        args.sum_stage_regex = [r"\.stage\.sum(?=[:.]|$)", r"PI0\.stage\.sum(?=[:.]|$)"]
+    if args.gen_stage_regex is None:
+        args.gen_stage_regex = [r"\.stage\.gen(?=[:.]|$)", r"PI0\.stage\.gen(?=[:.]|$)"]
 
     ncu_bin = shutil.which(args.ncu) if args.ncu == "ncu" else args.ncu
     if not ncu_bin:
@@ -398,7 +410,7 @@ def main() -> None:
         else:
             csv_path = path
         df, peaks = _load_csv(csv_path)
-        series.append((path.stem, df, peaks))
+        series.append((_display_stem_name(path.stem), df, peaks))
 
         if args.use_peak_formula:
             if peaks["peak_work_col"] and peaks["peak_cycles_col"]:
@@ -420,7 +432,100 @@ def main() -> None:
     colors = plt.get_cmap("tab10")
     size_by_bw = False
     points_rows = []
-    if args.aggregate_attn_fc:
+    if args.aggregate_stage_attn_fc:
+        attn_patterns = [re.compile(p) for p in args.attn_regex]
+        fc_patterns = [re.compile(p) for p in args.fc_regex]
+        sum_stage_patterns = [re.compile(p) for p in args.sum_stage_regex]
+        gen_stage_patterns = [re.compile(p) for p in args.gen_stage_regex]
+        group_styles = {
+            "sum_attn": {"color": "#f58518", "marker": "^", "label": "sum attn"},
+            "sum_fc": {"color": "#4c78a8", "marker": "o", "label": "sum fc"},
+            "gen_attn": {"color": "#e45756", "marker": "s", "label": "gen attn"},
+            "gen_fc": {"color": "#72b7b2", "marker": "D", "label": "gen fc"},
+            "sum_attn_gemm": {"color": "#f58518", "marker": "^", "label": "sum attn_gemm"},
+            "sum_attn_other": {"color": "#ffbf79", "marker": "v", "label": "sum attn_other"},
+            "gen_attn_gemm": {"color": "#e45756", "marker": "s", "label": "gen attn_gemm"},
+            "gen_attn_other": {"color": "#ff9da6", "marker": "P", "label": "gen attn_other"},
+        }
+        for _idx, (label, df, _peaks) in enumerate(series):
+            names = df["row_name"].astype(str)
+            attn_mask = names.apply(lambda s: any(p.search(s) for p in attn_patterns))
+            fc_mask = names.apply(lambda s: any(p.search(s) for p in fc_patterns))
+            sum_mask = names.apply(lambda s: any(p.search(s) for p in sum_stage_patterns))
+            gen_mask = names.apply(lambda s: any(p.search(s) for p in gen_stage_patterns))
+            kernel_names = df["Kernel Name"].astype(str) if "Kernel Name" in df.columns else None
+            if args.attn_sub_split and kernel_names is None:
+                print(f"[WARN] {label}: --attn-sub-split requested but 'Kernel Name' column is unavailable; ignoring split.")
+            attn_gemm_mask = (
+                kernel_names.str.contains(r"gemm", case=False, regex=True, na=False)
+                if (args.attn_sub_split and kernel_names is not None)
+                else None
+            )
+
+            matched_any = False
+            if args.attn_sub_split and attn_gemm_mask is not None:
+                groups = [
+                    ("sum_attn_gemm", sum_mask & attn_mask & attn_gemm_mask),
+                    ("sum_attn_other", sum_mask & attn_mask & ~attn_gemm_mask),
+                    ("sum_fc", sum_mask & fc_mask),
+                    ("gen_attn_gemm", gen_mask & attn_mask & attn_gemm_mask),
+                    ("gen_attn_other", gen_mask & attn_mask & ~attn_gemm_mask),
+                    ("gen_fc", gen_mask & fc_mask),
+                ]
+            else:
+                groups = [
+                    ("sum_attn", sum_mask & attn_mask),
+                    ("sum_fc", sum_mask & fc_mask),
+                    ("gen_attn", gen_mask & attn_mask),
+                    ("gen_fc", gen_mask & fc_mask),
+                ]
+            for group_key, mask in groups:
+                agg = _aggregate_category(df, mask)
+                if not agg:
+                    continue
+                matched_any = True
+                style = group_styles[group_key]
+                parts = group_key.split("_")
+                stage = parts[0]
+                if len(parts) == 2:
+                    block_type = parts[1]
+                    attn_subtype = ""
+                else:
+                    block_type = "_".join(parts[1:3])
+                    attn_subtype = parts[2] if parts[1] == "attn" else ""
+                points_rows.append(
+                    {
+                        "label": label,
+                        "group": group_key,
+                        "stage": stage,
+                        "block_type": block_type,
+                        "attn_subtype": attn_subtype,
+                        "ai": agg["ai"],
+                        "perf": agg["perf"],
+                        "time_s": agg["time"],
+                        "mem_bw_pct": agg["bw_pct"],
+                    }
+                )
+                ax.scatter(
+                    [agg["ai"]],
+                    [agg["perf"] / plot_scale],
+                    s=140,
+                    c=[style["color"]],
+                    marker=style["marker"],
+                    edgecolors="black",
+                    linewidths=0.4,
+                    label=f"{label} {style['label']}",
+                )
+            if not matched_any:
+                print(
+                    f"[WARN] {label}: no stage-tagged attn/fc kernels matched. "
+                    "Expected NVTX names containing '.stage.sum' / '.stage.gen'."
+                )
+        if args.attn_sub_split:
+            size_label = "Point size = fixed (aggregated sum/gen x (attn_gemm|attn_other|fc))"
+        else:
+            size_label = "Point size = fixed (aggregated sum/gen x attn/fc)"
+    elif args.aggregate_attn_fc:
         attn_patterns = [re.compile(p) for p in args.attn_regex]
         fc_patterns = [re.compile(p) for p in args.fc_regex]
         for idx, (label, df, _peaks) in enumerate(series):

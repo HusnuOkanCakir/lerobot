@@ -49,6 +49,10 @@ def _pick_columns(header: list[str], candidates: list[str]) -> list[str]:
     return [c for c in candidates if c in header]
 
 
+def _display_stem_name(stem: str) -> str:
+    return re.sub(r"^\d{8}_\d{6}_", "", stem)
+
+
 def _unit_scale(unit: str) -> float:
     if unit is None:
         return 1.0
@@ -159,6 +163,7 @@ def main() -> None:
     encoding = _detect_encoding(csv_path)
     header = _read_header(csv_path, encoding)
     kernel_name_col = "Kernel Name" if "Kernel Name" in header else None
+    id_col = "ID" if "ID" in header else None
     nvtx_cols = [
         "thread Domain:Push/Pop_Range:PL_Type:PL_Value:CLR_Type:Color:Msg_Type:Msg",
         "Id:Domain:Start/Stop_Range:PL_Type:PL_Value:CLR_Type:Color:Msg_Type:Msg",
@@ -223,6 +228,8 @@ def main() -> None:
         usecols.add(peak_traffic_cycles_col)
     if kernel_name_col:
         usecols.add(kernel_name_col)
+    if id_col:
+        usecols.add(id_col)
     for col in nvtx_cols:
         usecols.add(col)
 
@@ -335,7 +342,7 @@ def main() -> None:
     plt.yscale("log")
     plt.xlabel("HW Arithmetic Intensity [FLOP/byte]")
     plt.ylabel(f"HW Performance [FLOP/s] (1 = {perf_scale:.0e})")
-    title_name = csv_path.stem.replace("_", " ")
+    title_name = _display_stem_name(csv_path.stem).replace("_", " ")
     plt.title(f"{title_name} - Floating Point Operations Roofline")
 
     def _row_name(row) -> str:
@@ -396,7 +403,15 @@ def main() -> None:
                 score = (bw_pct * duration_s) / dist if dist > 0 else float("inf")
             else:
                 score = duration_s / dist if dist > 0 else float("inf")
-            bound_rows.append((bound, dist, score, duration_s, bw_pct, name))
+            kernel_id = row.get(id_col) if id_col else ""
+            if kernel_id is None or (isinstance(kernel_id, float) and math.isnan(kernel_id)):
+                kernel_id = ""
+            else:
+                try:
+                    kernel_id = str(int(float(kernel_id)))
+                except (ValueError, TypeError):
+                    kernel_id = str(kernel_id).strip()
+            bound_rows.append((kernel_id, bound, dist, score, duration_s, bw_pct, name))
 
     if kernel_name_col and args.top_n > 0:
         top = df.nlargest(args.top_n, "time_s")
@@ -412,12 +427,12 @@ def main() -> None:
     if args.out_list and bound_rows:
         out_list = Path(args.out_list)
         out_list.parent.mkdir(parents=True, exist_ok=True)
-        mem_rows = sorted([r for r in bound_rows if r[0] == "memory"], key=lambda r: r[2], reverse=True)
-        comp_rows = sorted([r for r in bound_rows if r[0] == "compute"], key=lambda r: r[2], reverse=True)
+        mem_rows = sorted([r for r in bound_rows if r[1] == "memory"], key=lambda r: r[3], reverse=True)
+        comp_rows = sorted([r for r in bound_rows if r[1] == "compute"], key=lambda r: r[3], reverse=True)
         with out_list.open("w", newline="", encoding="utf-8") as f:
-            f.write("name,bound,vertical_distance,score,duration_s,mem_bw_pct\n")
-            for bound, dist, score, duration_s, bw_pct, name in mem_rows + comp_rows:
-                f.write(f"\"{name}\",{bound},{dist},{score},{duration_s},{bw_pct}\n")
+            f.write("id,name,bound,vertical_distance,score,duration_s,mem_bw_pct\n")
+            for kernel_id, bound, dist, score, duration_s, bw_pct, name in mem_rows + comp_rows:
+                f.write(f"\"{kernel_id}\",\"{name}\",{bound},{dist},{score},{duration_s},{bw_pct}\n")
         print(f"Wrote {out_list}")
 
 
